@@ -1,136 +1,214 @@
 /*
- * Quadrature encoder wiring validation - BENCH TEST ONLY
+ * conVR treadmill encoder -> USB joystick firmware
  *
  * Target : Raspberry Pi Pico 2 W (RP2350), arduino-pico core
- * Encoder: CN3806 optical quadrature, ~600 PPR, NPN open-collector A/B
+ * Encoder: CN3806, 600 PPR, NPN open-collector quadrature output
  *
- * Wiring : A -> GP2, B -> GP3, encoder GND -> Pico GND (must be common!)
- *          Pull-ups: internal (INPUT_PULLUP), no external resistors assumed.
+ * Wiring:
+ *   Encoder red   -> VBUS (5 V)
+ *   Encoder black -> GND
+ *   Encoder green -> GP2 (phase A)
+ *   Encoder white -> GP3 (phase B)
+ *   1 kOhm from GP2 to 3V3 and 1 kOhm from GP3 to 3V3
  *
- * Turn the shaft slowly by hand: the count should climb steadily one way
- * and fall the other. 600 PPR with x4 decoding = 2400 counts per revolution.
+ * The encoder count is maintained entirely by a PIO state machine. The CPU
+ * samples that count at 100 Hz, converts the delta into belt velocity, and
+ * reports velocity as the USB gamepad's left-stick Y axis.
  */
 
-const uint8_t PIN_A = 2;   // GP2 - encoder channel A
-const uint8_t PIN_B = 3;   // GP3 - encoder channel B
+#include <Arduino.h>
+#include <Joystick.h>
+#include <USB.h>
+#include "hardware/pio.h"
+#include "quadrature_encoder.pio.h"
 
-volatile int32_t encoderCount = 0;   // signed running count, x4 decoded
-volatile uint32_t errorCount  = 0;   // illegal transitions (noise / missed edges)
-volatile uint8_t  lastState   = 0;   // previous (A<<1 | B), 0..3
+// Ask the USB host to poll HID reports every millisecond. New velocity reports
+// are produced every 10 ms; the shorter USB interval reduces delivery latency.
+int usb_hid_poll_interval = 1;
 
-/*
- * x4 quadrature decode, last-state method.
- *
- * State is packed as (A << 1) | B, so 0=00, 1=01, 2=10, 3=11.
- * Each edge on A or B walks the pair through a Gray-code ring where only
- * one bit changes per legal step:
- *
- *   00 -> 10 -> 11 -> 01 -> 00 ...   counted as +1 per step
- *   00 -> 01 -> 11 -> 10 -> 00 ...   counted as -1 per step
- *
- * (Which physical rotation is "+" depends on how A and B landed; if it
- * reads backwards for your setup, just swap the A and B wires.)
- *
- * We build a 4-bit index (previous state << 2) | new state and look up
- * the delta. Legal steps give +1 or -1. Two cases give 0: "no change"
- * (a spurious interrupt) and "both bits flipped" (a missed edge or a
- * glitch), which is illegal and gets tallied separately.
- */
-static const int8_t QUAD_TABLE[16] = {
-  //  new: 00  01  10  11
-         0, -1, +1,  0,   // prev 00
-        +1,  0,  0, -1,   // prev 01
-        -1,  0,  0, +1,   // prev 10
-         0, +1, -1,  0    // prev 11
-};
+namespace Config {
 
-// Shared ISR for both pins. Kept deliberately tiny: two reads, one table
-// lookup, one add. No Serial, no delays, no floating point.
-void encoderISR() {
-  uint8_t state = (digitalRead(PIN_A) << 1) | digitalRead(PIN_B);
-  int8_t  delta = QUAD_TABLE[(lastState << 2) | state];
+constexpr uint8_t PIN_A = 2;
+constexpr uint8_t PIN_B = 3;  // The PIO program requires B to immediately follow A.
 
-  if (delta != 0) {
-    encoderCount += delta;
-  } else if (state != lastState) {
-    // Both bits changed between interrupts: a step was lost or the line
-    // is bouncing/noisy. Counted so you can spot bad wiring.
-    errorCount++;
+constexpr float ENCODER_PULSES_PER_REVOLUTION = 600.0f;
+constexpr float QUADRATURE_COUNTS_PER_PULSE = 4.0f;
+constexpr float FRICTION_DISK_DIAMETER_METRES = 0.070f;
+constexpr float COUNTS_PER_METRE =
+    (ENCODER_PULSES_PER_REVOLUTION * QUADRATURE_COUNTS_PER_PULSE) /
+    (PI * FRICTION_DISK_DIAMETER_METRES);
+
+// This belt speed maps to full joystick deflection. Raise it if the axis clips
+// during a sprint, or lower it if games do not receive enough stick travel.
+constexpr float MAX_BELT_SPEED_MPS = 6.0f;  // 21.6 km/h
+
+// Set to -1 if the serial output reports negative speed while walking forward.
+constexpr int8_t ENCODER_DIRECTION = 1;
+
+constexpr uint32_t SAMPLE_INTERVAL_US = 10000;  // 100 Hz speed calculation
+constexpr uint32_t STOP_TIMEOUT_US = 40000;     // hard-centre after 40 ms idle
+constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 250;
+
+// Exponential smoothing. 1.0 is unfiltered; smaller values are smoother but
+// add latency. At 100 Hz, 0.35 responds quickly without amplifying count jitter.
+constexpr float VELOCITY_FILTER_ALPHA = 0.35f;
+constexpr float CENTRE_DEADBAND_MPS = 0.02f;
+
+}  // namespace Config
+
+static_assert(Config::PIN_B == Config::PIN_A + 1,
+              "The quadrature PIO program requires consecutive A/B pins");
+
+PIO encoderPio = pio0;
+int encoderStateMachine = -1;
+
+int32_t previousCount = 0;
+uint32_t previousSampleUs = 0;
+uint32_t lastMotionUs = 0;
+float filteredSpeedMps = 0.0f;
+bool serialWasConnected = false;
+
+int16_t speedToJoystickAxis(float speedMps) {
+  float normalised = speedMps / Config::MAX_BELT_SPEED_MPS;
+  normalised = constrain(normalised, -1.0f, 1.0f);
+
+  // Negative Y is "stick forward" in the conventional gamepad coordinate
+  // system, so positive treadmill speed is deliberately inverted here.
+  return static_cast<int16_t>(lroundf(-normalised * 32767.0f));
+}
+
+void centreJoystick() {
+  Joystick.position(0, 0);
+  Joystick.send_now();
+}
+
+void haltWithError(const __FlashStringHelper *message) {
+  centreJoystick();
+  while (true) {
+    Serial.println(message);
+    delay(1000);
+  }
+}
+
+void startEncoderPio() {
+  if (!pio_can_add_program(encoderPio, &quadrature_encoder_program)) {
+    haltWithError(F("ERROR: PIO0 instruction memory is unavailable"));
   }
 
-  lastState = state;
+  encoderStateMachine = pio_claim_unused_sm(encoderPio, false);
+  if (encoderStateMachine < 0) {
+    haltWithError(F("ERROR: PIO0 has no unused state machine"));
+  }
+
+  // This official Raspberry Pi program has a fixed origin of zero because it
+  // uses computed jumps. No other PIO programs are used by this sketch.
+  pio_add_program(encoderPio, &quadrature_encoder_program);
+  quadrature_encoder_program_init(
+      encoderPio, static_cast<uint>(encoderStateMachine), Config::PIN_A, 0);
+}
+
+void printStartupBanner() {
+  Serial.println();
+  Serial.println(F("=== conVR treadmill controller ==="));
+  Serial.println(F("PIO quadrature counter: GP2=A, GP3=B, x4 decoding"));
+  Serial.println(F("USB HID: 16-bit left-stick Y axis, centre=0"));
+  Serial.print(F("Counts per metre: "));
+  Serial.println(Config::COUNTS_PER_METRE, 2);
+  Serial.print(F("Full stick speed: "));
+  Serial.print(Config::MAX_BELT_SPEED_MPS, 2);
+  Serial.println(F(" m/s"));
+  Serial.println(F("count\tdelta\traw_m/s\tfiltered_m/s\taxis"));
+}
+
+void updateSerialConnection() {
+  const bool serialConnected = static_cast<bool>(Serial);
+  if (serialConnected && !serialWasConnected) {
+    printStartupBanner();
+  }
+  serialWasConnected = serialConnected;
 }
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(PIN_A, INPUT_PULLUP);
-  pinMode(PIN_B, INPUT_PULLUP);
+  // The arduino-pico Joystick library works with Tools > USB Stack > Pico SDK.
+  // Manual mode lets both axes be changed before emitting one coherent report.
+  USB.disconnect();
+  USB.setProduct("conVR Treadmill Controller");
+  Joystick.use16bit();
+  Joystick.useManualSend(true);
+  Joystick.begin();
+  centreJoystick();
 
-  // Seed the state machine with where the encoder actually sits right now,
-  // otherwise the very first edge looks like an illegal transition.
-  lastState = (digitalRead(PIN_A) << 1) | digitalRead(PIN_B);
+  startEncoderPio();
+  previousCount = quadrature_encoder_get_count(
+      encoderPio, static_cast<uint>(encoderStateMachine));
+  previousSampleUs = micros();
+  lastMotionUs = previousSampleUs;
 
-  attachInterrupt(digitalPinToInterrupt(PIN_A), encoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_B), encoderISR, CHANGE);
-
-  // Give USB CDC a moment to enumerate so the banner isn't missed.
-  unsigned long t0 = millis();
-  while (!Serial && millis() - t0 < 3000) {
-    delay(10);
-  }
-
-  Serial.println();
-  Serial.println(F("=== CN3806 quadrature encoder wiring test ==="));
-  Serial.println(F("Pico 2 W (RP2350) | A=GP2  B=GP3 | internal pull-ups | x4 decode"));
-  Serial.println(F("600 PPR -> 2400 counts/rev. Turn the shaft slowly by hand."));
-  Serial.print(F("Initial A/B state: "));
-  Serial.print((lastState >> 1) & 1);
-  Serial.println(lastState & 1);
-  Serial.println(F("---------------------------------------------"));
+  // Serial is diagnostic only. Controller operation never waits for a monitor.
+  updateSerialConnection();
 }
 
 void loop() {
-  static int32_t  lastPrinted = 0;
-  static uint32_t lastErrors  = 0;
-  static bool     firstPrint  = true;
-  static uint32_t lastPrintMs = 0;
+  updateSerialConnection();
 
-  // ~5 Hz sampling
-  if (millis() - lastPrintMs < 200) {
+  const uint32_t nowUs = micros();
+  const uint32_t elapsedUs = nowUs - previousSampleUs;
+  if (elapsedUs < Config::SAMPLE_INTERVAL_US) {
     return;
   }
-  lastPrintMs = millis();
 
-  // Snapshot both volatiles with interrupts off so count and error total
-  // come from the same instant.
-  noInterrupts();
-  int32_t  count  = encoderCount;
-  uint32_t errors = errorCount;
-  interrupts();
+  const int32_t count = quadrature_encoder_get_count(
+      encoderPio, static_cast<uint>(encoderStateMachine));
 
-  if (firstPrint || count != lastPrinted || errors != lastErrors) {
-    Serial.print(F("count = "));
+  // Unsigned subtraction makes the delta well-defined even when the PIO's
+  // signed 32-bit position counter eventually wraps around.
+  const int32_t delta = static_cast<int32_t>(
+      static_cast<uint32_t>(count) - static_cast<uint32_t>(previousCount));
+
+  previousCount = count;
+  previousSampleUs = nowUs;
+
+  float rawSpeedMps =
+      (static_cast<float>(delta) * Config::ENCODER_DIRECTION * 1000000.0f) /
+      (Config::COUNTS_PER_METRE * static_cast<float>(elapsedUs));
+
+  if (delta != 0) {
+    lastMotionUs = nowUs;
+  }
+
+  // Filtering makes normal movement feel steady. The explicit stop timeout is
+  // intentionally outside the filter so releasing the belt cannot leave a
+  // slowly decaying joystick command.
+  filteredSpeedMps += Config::VELOCITY_FILTER_ALPHA *
+                      (rawSpeedMps - filteredSpeedMps);
+
+  if (nowUs - lastMotionUs >= Config::STOP_TIMEOUT_US) {
+    rawSpeedMps = 0.0f;
+    filteredSpeedMps = 0.0f;
+  }
+
+  int16_t axis = speedToJoystickAxis(filteredSpeedMps);
+  if (fabsf(filteredSpeedMps) < Config::CENTRE_DEADBAND_MPS) {
+    axis = 0;
+  }
+
+  Joystick.position(0, axis);
+  Joystick.send_now();
+
+  static uint32_t lastDiagnosticMs = 0;
+  const uint32_t nowMs = millis();
+  if (Serial && nowMs - lastDiagnosticMs >= Config::DIAGNOSTIC_INTERVAL_MS) {
+    lastDiagnosticMs = nowMs;
     Serial.print(count);
-
-    if (!firstPrint) {
-      int32_t delta = count - lastPrinted;
-      Serial.print(F("  ("));
-      if (delta > 0) Serial.print('+');
-      Serial.print(delta);
-      Serial.print(F(")"));
-    }
-
-    if (errors) {
-      Serial.print(F("   [bad transitions: "));
-      Serial.print(errors);
-      Serial.print(F("]"));
-    }
-
-    Serial.println();
-
-    lastPrinted = count;
-    lastErrors  = errors;
-    firstPrint  = false;
+    Serial.print('\t');
+    Serial.print(delta);
+    Serial.print('\t');
+    Serial.print(rawSpeedMps, 3);
+    Serial.print('\t');
+    Serial.print(filteredSpeedMps, 3);
+    Serial.print('\t');
+    Serial.println(axis);
   }
 }
