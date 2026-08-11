@@ -10,6 +10,7 @@
  *   Encoder green -> GP2 (phase A)
  *   Encoder white -> GP3 (phase B)
  *   1 kOhm from GP2 to 3V3 and 1 kOhm from GP3 to 3V3
+ *   Pushbutton between GP4 and GND (physical pin 38)
  *
  * The encoder count is maintained entirely by a PIO state machine. The CPU
  * samples that count at 100 Hz, converts the delta into belt velocity, and
@@ -30,28 +31,33 @@ namespace Config {
 
 constexpr uint8_t PIN_A = 2;
 constexpr uint8_t PIN_B = 3;  // The PIO program requires B to immediately follow A.
+constexpr uint8_t PIN_BUTTON = 4;
+constexpr uint8_t SPRINT_BUTTON = 9;  // Conventional gamepad left-stick click.
 
 constexpr float ENCODER_PULSES_PER_REVOLUTION = 600.0f;
 constexpr float QUADRATURE_COUNTS_PER_PULSE = 4.0f;
-constexpr float FRICTION_DISK_DIAMETER_METRES = 0.070f;
+constexpr float FRICTION_DISK_DIAMETER_METRES = 0.075f;
 constexpr float COUNTS_PER_METRE =
     (ENCODER_PULSES_PER_REVOLUTION * QUADRATURE_COUNTS_PER_PULSE) /
     (PI * FRICTION_DISK_DIAMETER_METRES);
 
 // This belt speed maps to full joystick deflection. Raise it if the axis clips
 // during a sprint, or lower it if games do not receive enough stick travel.
-constexpr float MAX_BELT_SPEED_MPS = 6.0f;  // 21.6 km/h
+constexpr float MAX_BELT_SPEED_MPS = 1.4f;  // 5.04 km/h, calibrated on treadmill
+constexpr float SPRINT_START_SPEED_MPS = 0.80f;
+constexpr float SPRINT_RELEASE_SPEED_MPS = 0.65f;
 
 // Set to -1 if the serial output reports negative speed while walking forward.
 constexpr int8_t ENCODER_DIRECTION = 1;
 
 constexpr uint32_t SAMPLE_INTERVAL_US = 10000;  // 100 Hz speed calculation
-constexpr uint32_t STOP_TIMEOUT_US = 40000;     // hard-centre after 40 ms idle
+constexpr uint32_t STOP_TIMEOUT_US = 120000;    // hard-centre after 120 ms idle
 constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 250;
 
 // Exponential smoothing. 1.0 is unfiltered; smaller values are smoother but
-// add latency. At 100 Hz, 0.35 responds quickly without amplifying count jitter.
-constexpr float VELOCITY_FILTER_ALPHA = 0.35f;
+// add latency. At 100 Hz, 0.10 smooths the starts and stops within each step;
+// the separate stop timeout still centres immediately when motion has ended.
+constexpr float VELOCITY_FILTER_ALPHA = 0.10f;
 constexpr float CENTRE_DEADBAND_MPS = 0.02f;
 
 }  // namespace Config
@@ -66,6 +72,7 @@ int32_t previousCount = 0;
 uint32_t previousSampleUs = 0;
 uint32_t lastMotionUs = 0;
 float filteredSpeedMps = 0.0f;
+bool sprintActive = false;
 bool serialWasConnected = false;
 
 int16_t speedToJoystickAxis(float speedMps) {
@@ -117,7 +124,8 @@ void printStartupBanner() {
   Serial.print(F("Full stick speed: "));
   Serial.print(Config::MAX_BELT_SPEED_MPS, 2);
   Serial.println(F(" m/s"));
-  Serial.println(F("count\tdelta\traw_m/s\tfiltered_m/s\taxis"));
+  Serial.println(
+      F("count\tdelta\traw_m/s\tfiltered_m/s\taxis\tbutton\tsprint"));
 }
 
 void updateSerialConnection() {
@@ -130,6 +138,7 @@ void updateSerialConnection() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(Config::PIN_BUTTON, INPUT_PULLUP);
 
   // The arduino-pico Joystick library works with Tools > USB Stack > Pico SDK.
   // Manual mode lets both axes be changed before emitting one coherent report.
@@ -194,13 +203,29 @@ void loop() {
     axis = 0;
   }
 
+  if (filteredSpeedMps >= Config::SPRINT_START_SPEED_MPS) {
+    sprintActive = true;
+  } else if (filteredSpeedMps <= Config::SPRINT_RELEASE_SPEED_MPS) {
+    sprintActive = false;
+  }
+
+  const bool buttonPressed = digitalRead(Config::PIN_BUTTON) == LOW;
   Joystick.position(0, axis);
+  Joystick.button(1, buttonPressed);
+  Joystick.button(Config::SPRINT_BUTTON, sprintActive);
   Joystick.send_now();
 
   static uint32_t lastDiagnosticMs = 0;
+  static bool previousDiagnosticButton = false;
+  static bool previousDiagnosticSprint = false;
   const uint32_t nowMs = millis();
-  if (Serial && nowMs - lastDiagnosticMs >= Config::DIAGNOSTIC_INTERVAL_MS) {
+  const bool inputChanged = buttonPressed != previousDiagnosticButton ||
+                            sprintActive != previousDiagnosticSprint;
+  if (Serial && (inputChanged ||
+                 nowMs - lastDiagnosticMs >= Config::DIAGNOSTIC_INTERVAL_MS)) {
     lastDiagnosticMs = nowMs;
+    previousDiagnosticButton = buttonPressed;
+    previousDiagnosticSprint = sprintActive;
     Serial.print(count);
     Serial.print('\t');
     Serial.print(delta);
@@ -209,6 +234,10 @@ void loop() {
     Serial.print('\t');
     Serial.print(filteredSpeedMps, 3);
     Serial.print('\t');
-    Serial.println(axis);
+    Serial.print(axis);
+    Serial.print('\t');
+    Serial.print(buttonPressed ? 1 : 0);
+    Serial.print('\t');
+    Serial.println(sprintActive ? 1 : 0);
   }
 }
