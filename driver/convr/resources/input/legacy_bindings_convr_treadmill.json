@@ -1,0 +1,31 @@
+{
+  "controller_type": "convr_treadmill",
+  "description": "Default legacy-input mapping for the conVR treadmill",
+  "name": "conVR Treadmill",
+  "options": {},
+  "simulated_actions": [],
+  "bindings": {
+    "/actions/legacy": {
+      "sources": [
+        {
+          "path": "/user/treadmill/input/joystick",
+          "mode": "joystick",
+          "inputs": {
+            "position": {
+              "output": "/actions/legacy/in/Axis0"
+            }
+          }
+        },
+        {
+          "path": "/user/treadmill/input/sprint",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/legacy/in/Axis0_Press"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

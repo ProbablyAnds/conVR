@@ -1,0 +1,22 @@
+{
+  "jsonid": "input_profile",
+  "controller_type": "convr_treadmill",
+  "device_class": "TrackedDeviceClass_Controller",
+  "resource_root": "convr",
+  "driver_name": "convr",
+  "legacy_binding": "{convr}/input/legacy_bindings_convr_treadmill.json",
+  "input_bindingui_mode": "single_device",
+  "should_show_binding_errors": false,
+  "input_source": {
+    "/input/joystick": {
+      "type": "joystick",
+      "binding_image_point": [ 50, 50 ],
+      "order": 1
+    },
+    "/input/sprint": {
+      "type": "button",
+      "binding_image_point": [ 50, 100 ],
+      "order": 2
+    }
+  }
+}
