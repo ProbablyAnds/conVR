@@ -165,6 +165,49 @@ The window has five sections:
 | Response curve | 1.0 linear; above 1.0 softens the low end |
 | Sprint source | Hardware button (default) or a software threshold on output speed |
 
+### What this device actually reports
+
+Measured on the real controller, so you know what "correct" looks like before
+you start tuning:
+
+```
+name:  Raspberry Pi conVR Treadmill Controller
+axes:  6      buttons: 32     hats: 1
+idle:  every axis reads -1 (i.e. centred) with the belt stopped
+```
+
+The USB name carries a `Raspberry Pi ` vendor prefix, which is why the
+companion matches `device_name` as a **case-insensitive substring** — the
+default `conVR Treadmill Controller` finds it without you typing the prefix.
+
+The firmware numbers its HID buttons from 1; SDL numbers them from 0. That
+off-by-one is the single most likely reason a button "does nothing":
+
+| Firmware (`conVR.ino`) | HID button | SDL index to enter in the companion |
+| --- | --- | --- |
+| `Joystick.position(0, axis)` — belt speed on left-stick Y | axis Y | **axis 1** |
+| `Joystick.button(1, buttonPressed)` — the GP4 pushbutton | 1 | **button 0** |
+| `Joystick.button(SPRINT_BUTTON, sprintActive)` — auto-sprint | 9 | **button 8** |
+
+An axis stuck at `-32768` rather than `-1` is one the firmware never reports —
+it is not your belt axis. Always confirm by walking: the belt axis is the one
+whose bar moves.
+
+### Two sprint mechanisms — pick one
+
+Sprint can come from either end of the chain, and running both at once gives
+you two thresholds fighting each other:
+
+- **Firmware auto-sprint** (`SPRINT_START_SPEED_MPS` / `SPRINT_RELEASE_SPEED_MPS`
+  in `conVR.ino`, with hysteresis) arrives as HID button 9 → **SDL button 8**.
+  Use it by setting *Sprint button* to 8 and *Sprint source* to hardware.
+- **Companion software threshold** (*Sprint from speed*) fires on the shaped
+  output value instead, and is retunable without reflashing.
+
+Default configuration uses the hardware button at SDL index 0 — the physical
+pushbutton. Change *Sprint button* to 8 if you want the firmware's automatic
+speed-triggered sprint instead.
+
 ### Config file
 
 Plain INI, identical format on both operating systems:
@@ -199,6 +242,119 @@ with you.
    `grep convr ~/.steam/steam/logs/vrserver.txt` also shows the driver loading,
    the device activating, and the companion connecting or disconnecting.
 
+## Developing and testing without an HMD
+
+The whole PC side can be exercised headlessly on Linux, which is how it was
+built. The one thing that trips everyone up:
+
+> **vrserver only loads drivers once an OpenVR client connects.** Starting
+> vrserver on its own and finding no `convr` lines in the log proves nothing —
+> the driver was never asked for.
+
+### 1. Point SteamVR at the null HMD
+
+Back up `~/.steam/steam/config/steamvr.vrsettings` first, and restore it when
+you are done — these settings will stop your real headset working.
+
+```json
+{
+   "steamvr": {
+      "requireHmd": false,
+      "forcedDriver": "null",
+      "activateMultipleDrivers": true
+   },
+   "driver_null": { "enable": true },
+   "driver_convr": { "enable": true }
+}
+```
+
+In a test script, restore it from a shell trap so a failure cannot leave your
+config broken:
+
+```bash
+trap 'cp "$BACKUP" "$CFG"' EXIT
+```
+
+### 2. Start vrserver
+
+```bash
+SVR=~/.steam/steam/steamapps/common/SteamVR
+: > ~/.steam/steam/logs/vrserver.txt          # start from a clean log
+CONVR_DEBUG=1 LD_LIBRARY_PATH="$SVR/bin/linux64" "$SVR/bin/linux64/vrserver" &
+```
+
+`CONVR_DEBUG=1` must be set **on vrserver**, not on the companion — the driver
+reads it from the process it is loaded into.
+
+### 3. Connect a client to trigger driver loading
+
+`vrcmd` core-dumps on this setup. A tiny background app works and doubles as
+the read-back check — this is the whole program:
+
+```cpp
+// g++ -std=c++17 -I<openvr>/headers verify.cpp -o verify \
+//   -L$SVR/bin/linux64 -lopenvr_api -Wl,-rpath,$SVR/bin/linux64
+#include <openvr.h>
+#include <stdio.h>
+#include <thread>
+int main() {
+  vr::EVRInitError e{};
+  vr::IVRSystem* vrs = vr::VR_Init(&e, vr::VRApplication_Background);
+  if (!vrs) { printf("%s\n", vr::VR_GetVRInitErrorAsEnglishDescription(e)); return 1; }
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  for (vr::TrackedDeviceIndex_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+    if (!vrs->IsTrackedDeviceConnected(i)) continue;
+    char type[128]{};
+    vrs->GetStringTrackedDeviceProperty(i, vr::Prop_ControllerType_String, type, sizeof type, nullptr);
+    printf("[%2u] class=%d role=%d type=%s\n", i, (int)vrs->GetTrackedDeviceClass(i),
+           vrs->GetInt32TrackedDeviceProperty(i, vr::Prop_ControllerRoleHint_Int32, nullptr), type);
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(30));   // hold the session open
+  vr::VR_Shutdown();
+}
+```
+
+A healthy run prints the treadmill with role `4`
+(`TrackedControllerRole_Treadmill`):
+
+```
+[ 0] class=1 role=0 type=null_hmd
+[ 1] class=2 role=4 type=convr_treadmill
+```
+
+### 4. Read the log
+
+```bash
+grep convr ~/.steam/steam/logs/vrserver.txt
+```
+
+```
+convr: [convr] listening for the companion on /tmp/convr_treadmill-1000.sock
+Loaded server driver convr (IServerTrackedDeviceProvider_004) from .../driver_convr.so
+convr: [convr] treadmill device activated
+Driver 'convr' finished adding tracked device with serial number 'convr-treadmill-1'
+convr: [convr] companion connected
+convr: [convr] rx packets=914 x=+0.000 y=+0.184 button=1
+```
+
+That last line is the decisive one: it is the driver reporting what it received
+from the companion, so if it shows your belt values the whole chain below
+SteamVR is healthy.
+
+### Testing without walking on the belt
+
+To exercise the driver with known values, run a client of your own against the
+IPC endpoint instead of the companion — include `common/convr_ipc.h`, connect
+an `IpcClient`, and stream `TreadmillPacket`s. That is exactly what
+`common/ipc_selftest.cpp` does, and it is the quickest way to prove a signal
+path without a treadmill attached.
+
+### Gotcha when scripting this
+
+`pkill -f convr_companion` will match **the shell running your script**,
+because the pattern appears in that shell's own command line — it kills your
+test harness mid-run. Use `pkill -x convr_companion` instead.
+
 ## Binding it in Skyrim VR
 
 In the VR dashboard: **Settings → Controllers → Manage Controller Bindings →
@@ -216,21 +372,28 @@ Save the binding; SteamVR remembers it per-application.
 ### An honest caveat about legacy-input games
 
 Skyrim VR uses OpenVR's **legacy input** API rather than the modern
-action-based one. Two things follow, both confirmed by testing on Linux:
+action-based one. Both halves of what follows were measured on Linux, not
+assumed:
 
 - The treadmill's inputs **are** live and bindable through SteamVR's
-  action/binding system. Verified end to end: a value fed in by the companion
-  arrives as a bound analog action with the correct magnitude and sign, and the
-  sprint button arrives as a bound digital action.
+  action/binding system. A ramp fed in by the companion came back out as a
+  bound analog action sweeping the full `-1.000 … +0.995` with correct sign,
+  and the sprint button came back as a bound digital action toggling in sync,
+  over 200/200 clean update cycles.
 - SteamVR does **not** synthesise a legacy per-device controller state for a
-  treadmill-role device — `GetControllerState` on it reads zero. That API only
-  covers hand controllers, so a legacy game will never poll the treadmill
-  directly. Getting it into Skyrim VR therefore depends on the binding UI above
-  mapping the treadmill onto the legacy movement input.
+  treadmill-role device. `IVRSystem::GetControllerState` on it reads all zeros
+  while that same input is arriving correctly through the action API — that
+  call only covers hand controllers. A legacy game therefore never polls the
+  treadmill directly, and getting it into Skyrim VR depends on the binding UI
+  above mapping the treadmill onto the legacy movement input.
 
-If the treadmill does not appear as a bindable device under Skyrim VR
-specifically, that is the limitation to chase — the driver, the IPC, and the
-input components underneath it are all verified working.
+**If the treadmill does not move your character in Skyrim VR, start here.** Do
+not go hunting for bugs in the driver, the IPC, or the companion: those are
+verified working end to end, and the `[convr] rx packets=…` log line will
+confirm it in seconds. The question to answer is whether SteamVR's binding UI
+will map a treadmill-role device onto a legacy title's movement input.
+
+That last step needs a real HMD and had not been tried at the time of writing.
 
 ## Troubleshooting
 
@@ -238,10 +401,15 @@ input components underneath it are all verified working.
 | --- | --- |
 | Driver link never connects | SteamVR not running, or the driver is not enabled. `grep convr ~/.steam/steam/logs/vrserver.txt`. |
 | Driver never loads | `activateMultipleDrivers` is not set to `true`. |
-| Companion says connected but nothing moves | Wrong belt-speed axis. Watch **Live input** while walking. |
+| No `convr` lines in the log **at all** | Nothing has connected to vrserver yet, so it never loaded any drivers. Start a VR app (or the test client above). |
+| Companion says connected but nothing moves | Wrong belt-speed axis. Watch **Live input** while walking — the belt axis is the one whose bar moves. |
+| An axis sits at `-32768` and never moves | That axis is not reported by the firmware. It is not your belt axis. |
+| Sprint button does nothing | Firmware numbers buttons from 1, SDL from 0. The pushbutton is **SDL 0**; firmware auto-sprint is **SDL 8**. |
 | You walk forward and the game walks backward | Toggle *Invert forward*. |
 | Second companion shows "not connected" | By design — the driver serves one companion at a time and turns away extras cleanly. Close the first one. |
 | Stick never reaches full travel | Lower *Full deflection at*. |
+| Companion and driver both look healthy, game does nothing | Legacy-input limitation — see the caveat above before debugging anything else. |
+| Driver changes have no effect | Re-run `cmake --install` and restart SteamVR; the old `.so`/`.dll` stays loaded otherwise. |
 
 ## Layout
 
@@ -252,6 +420,42 @@ companion/  SDL2 + Dear ImGui tuning and streaming app
 ```
 
 The only OS-specific code in the project is inside `common/convr_ipc.cpp`.
+
+### The IPC link
+
+The driver is the server (it outlives the companion), the companion is the
+client. Frames are a fixed 16-byte `TreadmillPacket` — magic, `x`, `y`, button
+— so there is no parsing, and the reader realigns on the magic if anything ever
+goes out of step.
+
+| | Endpoint |
+| --- | --- |
+| Windows | `\\.\pipe\convr_treadmill` |
+| Linux | `/tmp/convr_treadmill-<uid>.sock` |
+
+The Linux path is deliberately derived from your uid rather than from
+`XDG_RUNTIME_DIR`: vrserver is often launched from a very different environment
+than the companion, and anything environment-dependent risks the two processes
+disagreeing about where to meet. Set `CONVR_IPC_PATH` on **both** processes to
+override it.
+
+The server runs a background thread doing blocking accept/read and publishes
+only the newest packet, so the driver's `RunFrame` never blocks on I/O. It
+serves one companion at a time and accepts-then-immediately-closes any extra,
+so a second copy gets a clean disconnect it can report and retry from rather
+than sends that mysteriously fail.
+
+### Driver interface versions
+
+Built against OpenVR `v2.5.1`, implementing `IServerTrackedDeviceProvider_004`
+and `ITrackedDeviceServerDriver_005`, using `IVRDriverInput_003` and
+`IVRServerDriverHost_006`. `GetInterfaceVersions()` returns
+`vr::k_InterfaceVersions`, so SteamVR checks compatibility for us.
+
+Note that the OpenVR interfaces have **non-virtual destructors**, so the driver
+classes deliberately do not mark theirs `override`. Nothing deletes these
+objects through a base pointer — the provider owns the device, and the provider
+itself is a static.
 
 Run the IPC self-test with:
 
