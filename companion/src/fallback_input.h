@@ -12,6 +12,7 @@
 // SteamVR route is analog and this one is not.
 #pragma once
 
+#include <chrono>
 #include <string>
 
 namespace convr {
@@ -54,7 +55,17 @@ class KeyboardFallback {
   const std::string& status() const { return status_; }
 
  private:
+  using Clock = std::chrono::steady_clock;
+
   void HoldKey(int scancode, bool want_down, bool* held);
+
+  // A walking belt is not a steady signal: each footfall drives it and it
+  // coasts back between steps, so the raw value crosses the threshold several
+  // times per second. Pressing and releasing a key on every crossing produces
+  // a stutter rather than walking. `Latch` presses immediately but delays the
+  // release by hold_ms, so a gap between steps keeps the key down.
+  bool Latch(bool above_press, bool above_release, bool held,
+             Clock::time_point* release_at, int hold_ms);
 
   bool forward_held_ = false;
   bool back_held_ = false;
@@ -63,6 +74,9 @@ class KeyboardFallback {
   int held_forward_scancode_ = 0;
   int held_back_scancode_ = 0;
   int held_sprint_scancode_ = 0;
+  Clock::time_point forward_release_at_{};
+  Clock::time_point back_release_at_{};
+  Clock::time_point sprint_release_at_{};
   std::string status_ = "idle";
 };
 

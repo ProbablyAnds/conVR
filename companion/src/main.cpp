@@ -492,6 +492,14 @@ int main(int argc, char** argv) {
         ImGui::SetItemTooltip(
             "Belt output above this holds the key down. Below it, released.");
 
+        ImGui::SliderInt("Hold after stop (ms)", &config.fallback_hold_ms, 0,
+                         1200, "%d ms");
+        ImGui::SetItemTooltip(
+            "The belt speeds up and slows down once per step, so it dips below "
+            "the threshold between footfalls. This keeps the key down across "
+            "the dip. Too low and you stutter; too high and you keep walking "
+            "after you stop.");
+
         auto key_combo = [](const char* label, int* scancode, bool modifier) {
           int count = 0;
           const convr::KeyChoice* choices =

@@ -125,6 +125,33 @@ void KeyboardFallback::ReleaseAll() {
   if (forward_held_) HoldKey(held_forward_scancode_, false, &forward_held_);
   if (back_held_) HoldKey(held_back_scancode_, false, &back_held_);
   if (sprint_held_) HoldKey(held_sprint_scancode_, false, &sprint_held_);
+  forward_release_at_ = Clock::time_point{};
+  back_release_at_ = Clock::time_point{};
+  sprint_release_at_ = Clock::time_point{};
+}
+
+bool KeyboardFallback::Latch(bool above_press, bool above_release, bool held,
+                             Clock::time_point* release_at, int hold_ms) {
+  if (above_press) {
+    // Any fresh step cancels a pending release outright.
+    *release_at = Clock::time_point{};
+    return true;
+  }
+  if (!held) return false;
+  // Between the release and press thresholds the key simply stays down; the
+  // countdown only starts once the belt has genuinely gone quiet.
+  if (above_release) {
+    *release_at = Clock::time_point{};
+    return true;
+  }
+  const Clock::time_point now = Clock::now();
+  if (*release_at == Clock::time_point{}) {
+    *release_at = now + std::chrono::milliseconds(hold_ms);
+  }
+  // Deliberately not an early "return true" on the frame the deadline is set:
+  // that would grant an extra frame of hold, and would make hold_ms=0 never
+  // release at all until a second update came in.
+  return now < *release_at;
 }
 
 void KeyboardFallback::Update(const Config& config, float joystick_y,
@@ -156,10 +183,23 @@ void KeyboardFallback::Update(const Config& config, float joystick_y,
     return;
   }
 
-  const float threshold = std::max(config.fallback_threshold, 0.01f);
-  const bool want_forward = joystick_y > threshold;
-  const bool want_back = joystick_y < -threshold;
-  const bool want_sprint = want_forward && sprint;
+  const float press = std::max(config.fallback_threshold, 0.01f);
+  // Releasing at the same level it presses at would make the key chatter while
+  // the belt hovers on the threshold, so release is deliberately lower.
+  const float release = press * 0.5f;
+  const int hold_ms = std::max(config.fallback_hold_ms, 0);
+
+  const bool want_forward =
+      Latch(joystick_y > press, joystick_y > release, forward_held_,
+            &forward_release_at_, hold_ms);
+  const bool want_back =
+      Latch(joystick_y < -press, joystick_y < -release, back_held_,
+            &back_release_at_, hold_ms);
+  // Sprint follows the same latch so it does not flicker off between steps
+  // while the belt is still clearly at running speed.
+  const bool want_sprint =
+      want_forward && Latch(sprint, sprint, sprint_held_, &sprint_release_at_,
+                            hold_ms);
 
   if (!forward_held_) held_forward_scancode_ = config.fallback_forward_key;
   if (!back_held_) held_back_scancode_ = config.fallback_back_key;

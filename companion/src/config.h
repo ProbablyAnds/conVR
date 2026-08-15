@@ -36,6 +36,10 @@ struct Config {
   // treadmill through SteamVR, not the normal path.
   bool fallback_enabled = false;
   float fallback_threshold = 0.15f;  // output speed at which the key goes down
+  // A walking belt is driven in pulses - one per footfall - so the speed dips
+  // between steps. Without a hold the key would be released in every dip and
+  // the character would stutter instead of walking.
+  int fallback_hold_ms = 400;
   int fallback_forward_key = 0x11;   // W
   int fallback_back_key = 0x1F;      // S
   int fallback_sprint_key = 0x2A;    // Left Shift

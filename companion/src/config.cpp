@@ -79,6 +79,8 @@ bool Config::Load(const std::string& path, std::string* error) {
       fallback_enabled = atoi(value.c_str()) != 0;
     } else if (key == "fallback_threshold") {
       fallback_threshold = static_cast<float>(atof(value.c_str()));
+    } else if (key == "fallback_hold_ms") {
+      fallback_hold_ms = atoi(value.c_str());
     } else if (key == "fallback_forward_key") {
       fallback_forward_key = atoi(value.c_str());
     } else if (key == "fallback_back_key") {
@@ -131,6 +133,10 @@ bool Config::Save(const std::string& path, std::string* error) const {
        << "# set-1 scancodes: W=17 S=31 LShift=42 LAlt=56 LCtrl=29.\n"
        << "fallback_enabled=" << (fallback_enabled ? 1 : 0) << "\n"
        << "fallback_threshold=" << fallback_threshold << "\n"
+       << "# How long the key stays down after the belt drops below threshold.\n"
+       << "# Bridges the dip between footfalls; too low stutters, too high\n"
+       << "# keeps walking after you stop.\n"
+       << "fallback_hold_ms=" << fallback_hold_ms << "\n"
        << "fallback_forward_key=" << fallback_forward_key << "\n"
        << "fallback_back_key=" << fallback_back_key << "\n"
        << "fallback_sprint_key=" << fallback_sprint_key << "\n"
