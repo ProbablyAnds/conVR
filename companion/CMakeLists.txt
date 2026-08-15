@@ -21,6 +21,12 @@ else()
     list(APPEND CONVR_SDL2_TARGETS PkgConfig::SDL2PC)
   else()
     message(STATUS "conVR: fetching and building SDL2")
+    # SDL 2.30's own cmake_minimum_required is 3.0, and CMake 4 dropped
+    # compatibility with anything below 3.5 - without this the SDL2
+    # subproject fails to configure before a line of it is compiled.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
+      set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    endif()
     set(SDL_SHARED ON CACHE BOOL "" FORCE)
     set(SDL_STATIC OFF CACHE BOOL "" FORCE)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -68,6 +74,7 @@ target_link_libraries(convr_imgui PUBLIC ${CONVR_SDL2_TARGETS})
 add_executable(convr_companion
   src/main.cpp
   src/config.cpp
+  src/fallback_input.cpp
 )
 target_link_libraries(convr_companion PRIVATE
   convr_common
@@ -85,6 +92,12 @@ endforeach()
 
 if(MSVC)
   target_compile_definitions(convr_companion PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# A desktop app should not drag a console window along behind it. SDL2main
+# supplies the WinMain that forwards to main(), so this needs no source change.
+if(WIN32)
+  set_target_properties(convr_companion PROPERTIES WIN32_EXECUTABLE ON)
 endif()
 
 # Windows needs SDL2.dll beside the exe when SDL2 was fetched and built here.

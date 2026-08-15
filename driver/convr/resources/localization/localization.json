@@ -1,0 +1,8 @@
+[
+  {
+    "language_tag": "en_US",
+    "convr_treadmill": "conVR Treadmill",
+    "/input/joystick": "Treadmill Motion",
+    "/input/sprint": "Sprint Button"
+  }
+]

@@ -12,7 +12,7 @@
           "mode": "joystick",
           "inputs": {
             "position": {
-              "output": "/actions/legacy/in/Axis0"
+              "output": "/actions/legacy/in/left_axis0_value"
             }
           }
         },
@@ -21,7 +21,7 @@
           "mode": "button",
           "inputs": {
             "click": {
-              "output": "/actions/legacy/in/Axis0_Press"
+              "output": "/actions/legacy/in/left_axis0_press"
             }
           }
         }

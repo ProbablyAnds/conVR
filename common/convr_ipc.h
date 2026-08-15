@@ -88,6 +88,10 @@ class IpcClient {
  private:
   bool connected_ = false;
   intptr_t handle_ = -1;
+  // Windows only: the event the overlapped write waits on, so a wedged
+  // vrserver times out instead of blocking the caller's thread. Unused (-1)
+  // on POSIX, where SO_SNDTIMEO covers the same ground.
+  intptr_t event_handle_ = -1;
   std::string endpoint_;
   std::string last_error_;
 };

@@ -86,7 +86,7 @@ int main() {
     // Starting the companion twice must not wedge either copy: the newcomer
     // gets a clean disconnect, and the incumbent keeps streaming.
     convr::IpcClient second;
-    second.Connect(endpoint);
+    const bool second_connected = second.Connect(endpoint);
     bool second_send_stopped = false;
     for (int i = 0; i < 100; ++i) {
       if (!second.Send(MakePacket(0.0f, 0.123f, false))) {
@@ -104,7 +104,21 @@ int main() {
           "server still receives from the original client");
     Check(server.LatestPacket(&received) && received.joystick_y == 0.25f,
           "server never mixed in the second client's data");
+
+    // Everything above holds on both platforms. Where they differ is *who*
+    // does the refusing, and only the POSIX side has anything to count.
+#if defined(_WIN32)
+    // A single-instance named pipe rejects the second client in the kernel:
+    // CreateFile fails with ERROR_PIPE_BUSY and the server is never involved.
+    Check(!second_connected, "the pipe itself refused the second client");
+    Check(server.rejected_clients() == 0,
+          "server had no rejection to count (the OS handled it)");
+#else
+    // The listening socket would otherwise leave a second companion stuck
+    // unaccepted in the backlog, so the server accepts and closes it itself.
+    Check(second_connected, "second client reaches the listening socket");
     Check(server.rejected_clients() > 0, "server counted the rejection");
+#endif
   }
 
   printf("disconnect and reconnect:\n");

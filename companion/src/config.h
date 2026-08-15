@@ -31,6 +31,20 @@ struct Config {
   SprintSource sprint_source = SprintSource::kHardwareButton;
   float sprint_threshold = 0.55f;  // output speed at which software sprint fires
 
+  // --- keyboard fallback (see fallback_input.h) ---
+  // Off by default: this is the escape hatch for games that cannot read the
+  // treadmill through SteamVR, not the normal path.
+  bool fallback_enabled = false;
+  float fallback_threshold = 0.15f;  // output speed at which the key goes down
+  int fallback_forward_key = 0x11;   // W
+  int fallback_back_key = 0x1F;      // S
+  int fallback_sprint_key = 0x2A;    // Left Shift
+  // Synthetic keystrokes go to whatever window has focus, so by default they
+  // are only sent while the game itself is focused. Turning this off means the
+  // treadmill types into whatever you have open.
+  bool fallback_require_focus = true;
+  std::string fallback_target_process = "SkyrimVR";
+
   // Reads `path`. Missing keys keep their default; a missing file is not an
   // error, it just means "first run".
   bool Load(const std::string& path, std::string* error);

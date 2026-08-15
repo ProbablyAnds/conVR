@@ -14,6 +14,7 @@
 
 #include "config.h"
 #include "convr_ipc.h"
+#include "fallback_input.h"
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
@@ -40,6 +41,17 @@ std::string ToLower(std::string text) {
   std::transform(text.begin(), text.end(), text.begin(),
                  [](unsigned char c) { return static_cast<char>(tolower(c)); });
   return text;
+}
+
+// UI scale factor for the primary display, 1.0 at the 96 dpi the layout is
+// authored for. Clamped because a bogus dpi reading should degrade to a
+// readable window rather than an unusable one.
+float DisplayScale() {
+  float ddpi = 0.0f, hdpi = 0.0f, vdpi = 0.0f;
+  if (SDL_GetDisplayDPI(0, &ddpi, &hdpi, &vdpi) != 0 || ddpi <= 0.0f) {
+    return 1.0f;
+  }
+  return std::clamp(ddpi / 96.0f, 1.0f, 3.0f);
 }
 
 std::vector<DeviceEntry> EnumerateDevices() {
@@ -114,17 +126,36 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Both hints must be set before SDL_Init: the joystick subsystem latches
+  // them at init time. Getting the first one wrong is the whole ballgame on
+  // Windows - the companion sits unfocused behind the game while you are in
+  // the headset, and without it SDL stops delivering treadmill input the
+  // moment the window loses focus.
+  SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+  // Without this the process is DPI-unaware and Windows bitmap-stretches the
+  // whole window on a scaled display, which is both blurry and mis-sized.
+  SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK) != 0) {
     SDL_Log("SDL_Init failed: %s", SDL_GetError());
     return 1;
   }
-  // Keep reading the treadmill while the user is looking at the game, not
-  // at this window.
-  SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+
+  // Windows desktops are routinely at 125-200% scaling where Linux ones are
+  // not, so the layout is authored at 96 dpi and scaled up from there.
+  const float ui_scale = DisplayScale();
+  int window_w = static_cast<int>(700 * ui_scale);
+  int window_h = static_cast<int>(860 * ui_scale);
+  // A 200% display would otherwise put the bottom of the window off-screen.
+  SDL_Rect usable = {};
+  if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.h > 0) {
+    window_w = std::min(window_w, usable.w);
+    window_h = std::min(window_h, usable.h);
+  }
 
   SDL_Window* window = SDL_CreateWindow(
       "conVR Treadmill Companion", SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, 700, 860,
+      SDL_WINDOWPOS_CENTERED, window_w, window_h,
       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
   if (window == nullptr) {
     SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
@@ -152,6 +183,14 @@ int main(int argc, char** argv) {
   // without this ImGui drops an imgui.ini into whatever directory you ran from.
   ImGui::GetIO().IniFilename = nullptr;
   ImGui::StyleColorsDark();
+  if (ui_scale > 1.0f) {
+    // Padding, borders and rounding first, then the font at a matching size -
+    // FontGlobalScale would resample the bitmap font and read as blurry.
+    ImGui::GetStyle().ScaleAllSizes(ui_scale);
+    ImFontConfig font_config;
+    font_config.SizePixels = 13.0f * ui_scale;
+    ImGui::GetIO().Fonts->AddFontDefault(&font_config);
+  }
   ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
   ImGui_ImplSDLRenderer2_Init(renderer);
 
@@ -165,6 +204,9 @@ int main(int argc, char** argv) {
   }
 
   convr::IpcClient ipc;
+  // Destroyed at the end of main, and its destructor lets go of every key it
+  // is holding - quitting mid-stride must not leave W stuck down.
+  convr::KeyboardFallback fallback;
   std::vector<DeviceEntry> devices = EnumerateDevices();
   SDL_Joystick* joystick = nullptr;
   std::string open_device_name;
@@ -261,6 +303,10 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Driven from the same values the driver gets, so what the game sees can
+    // never disagree with what the "Sent to SteamVR" panel is showing.
+    fallback.Update(config, output.y, output.button);
+
     // --- UI ---
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
@@ -273,6 +319,11 @@ int main(int argc, char** argv) {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                      ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    // ImGui puts a widget's label to its right, and the default item width is
+    // wide enough that the longest labels ran off the edge of the window.
+    // Reserving a fixed gutter keeps every label readable at any window size.
+    ImGui::PushItemWidth(-220.0f * ui_scale);
 
     const ImVec4 kGood(0.35f, 0.85f, 0.45f, 1.0f);
     const ImVec4 kBad(0.95f, 0.45f, 0.40f, 1.0f);
@@ -424,6 +475,68 @@ int main(int argc, char** argv) {
       }
     }
 
+    // ---- Keyboard fallback ----
+    if (ImGui::CollapsingHeader("Keyboard fallback (legacy games)")) {
+      ImGui::TextWrapped(
+          "For games that cannot see the treadmill through SteamVR. Sends real "
+          "keystrokes instead of stick movement, so it is on/off rather than "
+          "analog. Leave this off if the SteamVR binding works.");
+      ImGui::Checkbox("Enable keyboard fallback", &config.fallback_enabled);
+
+      if (config.fallback_enabled) {
+        ImGui::TextColored(fallback.target_focused() ? kGood : kDim, "%s",
+                           fallback.status().c_str());
+
+        ImGui::SliderFloat("Key-down threshold", &config.fallback_threshold,
+                           0.02f, 0.9f, "%.2f");
+        ImGui::SetItemTooltip(
+            "Belt output above this holds the key down. Below it, released.");
+
+        auto key_combo = [](const char* label, int* scancode, bool modifier) {
+          int count = 0;
+          const convr::KeyChoice* choices =
+              modifier ? convr::ModifierKeyChoices(&count)
+                       : convr::MovementKeyChoices(&count);
+          if (ImGui::BeginCombo(label, convr::KeyLabelForScancode(*scancode))) {
+            for (int i = 0; i < count; ++i) {
+              const bool selected = choices[i].scancode == *scancode;
+              if (ImGui::Selectable(choices[i].label, selected)) {
+                *scancode = choices[i].scancode;
+              }
+              if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+          }
+        };
+        key_combo("Forward key", &config.fallback_forward_key, false);
+        key_combo("Backward key", &config.fallback_back_key, false);
+        key_combo("Sprint key", &config.fallback_sprint_key, true);
+
+        ImGui::Checkbox("Only send while the game is focused",
+                        &config.fallback_require_focus);
+        ImGui::SetItemTooltip(
+            "Strongly recommended. Synthetic keystrokes go to whatever window "
+            "has focus - with this off, walking types into your browser.");
+
+        char target[128] = {};
+        snprintf(target, sizeof(target), "%s",
+                 config.fallback_target_process.c_str());
+        if (ImGui::InputText("Game process", target, sizeof(target))) {
+          config.fallback_target_process = target;
+        }
+        ImGui::SetItemTooltip("Executable name, with or without .exe.");
+
+        ImGui::TextColored(kDim, "keys held: %s%s%s",
+                           fallback.forward_held() ? "forward " : "",
+                           fallback.back_held() ? "back " : "",
+                           fallback.sprint_held() ? "sprint" : "");
+        if (!config.fallback_require_focus) {
+          ImGui::TextColored(kBad,
+                             "Focus check is OFF - keystrokes go to any window.");
+        }
+      }
+    }
+
     // ---- Config file ----
     if (ImGui::CollapsingHeader("Config file",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -448,6 +561,7 @@ int main(int argc, char** argv) {
       ImGui::TextColored(kDim, "%s", status_message.c_str());
     }
 
+    ImGui::PopItemWidth();
     ImGui::End();
 
     ImGui::Render();

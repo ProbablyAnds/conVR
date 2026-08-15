@@ -27,6 +27,16 @@ else()
 endif()
 set(CONVR_STAGE_DIR "${CMAKE_BINARY_DIR}/convr")
 
+# SteamVR only ever loads bin/win64 and bin/linux64. A 32-bit build would
+# stage a DLL into win64 that vrserver then refuses to load, with nothing in
+# the log to say why - so fail here instead, while the cause is still obvious.
+# Visual Studio 2019 and older default their generator platform to Win32.
+if(CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR
+    "conVR must be built 64-bit; this toolchain is ${CMAKE_SIZEOF_VOID_P}-byte "
+    "pointers.\nWith a Visual Studio generator, configure with -A x64.")
+endif()
+
 # ---------------------------------------------------------------------------
 # OpenVR: the driver needs headers only. It never links openvr_api - SteamVR
 # resolves everything through the driver context at load time. So instead of
@@ -71,6 +81,10 @@ find_package(Threads REQUIRED)
 add_library(convr_common STATIC common/convr_ipc.cpp)
 target_include_directories(convr_common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/common")
 target_link_libraries(convr_common PUBLIC Threads::Threads)
+if(MSVC)
+  # getenv() is perfectly correct here; MSVC deprecates it regardless.
+  target_compile_definitions(convr_common PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 
 option(CONVR_BUILD_TESTS "Build the IPC self-test" OFF)
 if(CONVR_BUILD_TESTS)
@@ -78,6 +92,14 @@ if(CONVR_BUILD_TESTS)
   target_link_libraries(convr_ipc_selftest PRIVATE convr_common)
   set_target_properties(convr_ipc_selftest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  # Multi-config generators (Visual Studio) otherwise append Release/ or Debug/.
+  foreach(_config IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set_target_properties(convr_ipc_selftest PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY_${_config} "${CMAKE_BINARY_DIR}/bin")
+  endforeach()
+  if(MSVC)
+    target_compile_definitions(convr_ipc_selftest PRIVATE _CRT_SECURE_NO_WARNINGS)
+  endif()
   enable_testing()
   add_test(NAME ipc_roundtrip COMMAND convr_ipc_selftest)
 endif()

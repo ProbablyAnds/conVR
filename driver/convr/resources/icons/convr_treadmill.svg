@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Binding-UI artwork for the conVR treadmill.
+
+     width/height/viewBox are all 300x300 on purpose: the binding UI scales
+     binding_image_point by (rendered size / intrinsic size), so keeping the
+     intrinsic size equal to the coordinate space means the points in
+     convr_treadmill_profile.json are plain SVG coordinates. -->
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="300" height="300" viewBox="0 0 300 300" xml:space="preserve">
+<style type="text/css">
+	.body{fill:none;stroke:#FFFFFF;stroke-width:6;stroke-linecap:round;stroke-linejoin:round;}
+	.detail{fill:none;stroke:#FFFFFF;stroke-width:4;stroke-linecap:round;stroke-linejoin:round;}
+	.solid{fill:#FFFFFF;}
+</style>
+
+<!-- walking dish -->
+<ellipse class="body" cx="150" cy="200" rx="118" ry="58"/>
+<ellipse class="detail" cx="150" cy="196" rx="74" ry="36"/>
+
+<!-- low-friction surface hint -->
+<path class="detail" d="M108,182 L192,182"/>
+<path class="detail" d="M96,196 L204,196"/>
+<path class="detail" d="M108,210 L192,210"/>
+
+<!-- support ring the user stands inside -->
+<ellipse class="body" cx="150" cy="104" rx="66" ry="24"/>
+
+<!-- uprights tying the ring to the dish -->
+<path class="body" d="M84,104 C76,140 70,160 62,178"/>
+<path class="body" d="M216,104 C224,140 230,160 238,178"/>
+
+<!-- direction of travel -->
+<path class="solid" d="M150,132 L163,156 L150,150 L137,156 Z"/>
+</svg>

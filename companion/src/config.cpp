@@ -75,6 +75,20 @@ bool Config::Load(const std::string& path, std::string* error) {
                           : SprintSource::kHardwareButton;
     } else if (key == "sprint_threshold") {
       sprint_threshold = static_cast<float>(atof(value.c_str()));
+    } else if (key == "fallback_enabled") {
+      fallback_enabled = atoi(value.c_str()) != 0;
+    } else if (key == "fallback_threshold") {
+      fallback_threshold = static_cast<float>(atof(value.c_str()));
+    } else if (key == "fallback_forward_key") {
+      fallback_forward_key = atoi(value.c_str());
+    } else if (key == "fallback_back_key") {
+      fallback_back_key = atoi(value.c_str());
+    } else if (key == "fallback_sprint_key") {
+      fallback_sprint_key = atoi(value.c_str());
+    } else if (key == "fallback_require_focus") {
+      fallback_require_focus = atoi(value.c_str()) != 0;
+    } else if (key == "fallback_target_process") {
+      fallback_target_process = value;
     }
   }
 
@@ -110,7 +124,20 @@ bool Config::Save(const std::string& path, std::string* error) const {
        << "curve_exponent=" << curve_exponent << "\n"
        << "# sprint_source: 0 = hardware button, 1 = software speed threshold\n"
        << "sprint_source=" << static_cast<int>(sprint_source) << "\n"
-       << "sprint_threshold=" << sprint_threshold << "\n";
+       << "sprint_threshold=" << sprint_threshold << "\n"
+       << "\n"
+       << "# Keyboard fallback for games that cannot read the treadmill through\n"
+       << "# SteamVR (legacy-input titles). Off unless you need it. Keys are\n"
+       << "# set-1 scancodes: W=17 S=31 LShift=42 LAlt=56 LCtrl=29.\n"
+       << "fallback_enabled=" << (fallback_enabled ? 1 : 0) << "\n"
+       << "fallback_threshold=" << fallback_threshold << "\n"
+       << "fallback_forward_key=" << fallback_forward_key << "\n"
+       << "fallback_back_key=" << fallback_back_key << "\n"
+       << "fallback_sprint_key=" << fallback_sprint_key << "\n"
+       << "# With require_focus off, the treadmill types into whatever window\n"
+       << "# happens to be focused. Leave it on unless you know why not.\n"
+       << "fallback_require_focus=" << (fallback_require_focus ? 1 : 0) << "\n"
+       << "fallback_target_process=" << fallback_target_process << "\n";
 
   if (!file.good()) {
     if (error) *error = "write failed for " + path;

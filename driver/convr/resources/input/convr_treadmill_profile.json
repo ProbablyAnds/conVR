@@ -7,15 +7,22 @@
   "legacy_binding": "{convr}/input/legacy_bindings_convr_treadmill.json",
   "input_bindingui_mode": "single_device",
   "should_show_binding_errors": false,
+  "priority": 5,
+  "input_bindingui_left": {
+    "image": "{convr}/icons/convr_treadmill.svg"
+  },
+  "input_bindingui_right": {
+    "image": "{convr}/icons/convr_treadmill.svg"
+  },
   "input_source": {
     "/input/joystick": {
       "type": "joystick",
-      "binding_image_point": [ 50, 50 ],
+      "binding_image_point": [ 150, 200 ],
       "order": 1
     },
     "/input/sprint": {
       "type": "button",
-      "binding_image_point": [ 50, 100 ],
+      "binding_image_point": [ 150, 104 ],
       "order": 2
     }
   }

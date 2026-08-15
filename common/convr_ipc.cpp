@@ -1,5 +1,6 @@
 #include "convr_ipc.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <chrono>
@@ -31,6 +32,8 @@ double NowSeconds() {
 
 #if defined(_WIN32)
 constexpr intptr_t kInvalid = -1;
+// Bounds a client Send(). POSIX gets the same guarantee from SO_SNDTIMEO.
+constexpr int kSendTimeoutMs = 100;
 inline HANDLE ToHandle(intptr_t h) { return reinterpret_cast<HANDLE>(h); }
 inline intptr_t FromHandle(HANDLE h) { return reinterpret_cast<intptr_t>(h); }
 
@@ -53,6 +56,11 @@ constexpr intptr_t kInvalid = -1;
 
 std::string EndpointPath(const char* name) {
 #if defined(_WIN32)
+  // Honoured on both platforms so a second instance can be tested side by
+  // side. Set it on the companion *and* on whatever launches vrserver.
+  if (const char* override_path = getenv("CONVR_IPC_PATH")) {
+    return std::string(override_path);
+  }
   return std::string("\\\\.\\pipe\\") + name;
 #else
   // Deterministic and environment-independent: vrserver may be launched from a
@@ -346,14 +354,25 @@ bool IpcClient::Connect(const char* name) {
   if (connected_) return true;
   endpoint_ = EndpointPath(name);
 
+  // FILE_FLAG_OVERLAPPED so Send() can bound how long it waits. A second
+  // companion lands here with ERROR_PIPE_BUSY, because the driver's pipe is
+  // created with a single instance - that is the clean refusal it reports.
   HANDLE pipe = CreateFileA(endpoint_.c_str(), GENERIC_WRITE, 0, nullptr,
-                            OPEN_EXISTING, 0, nullptr);
+                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
   if (pipe == INVALID_HANDLE_VALUE) {
     last_error_ = LastErrorString();
     return false;
   }
 
+  HANDLE event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  if (event == nullptr) {
+    last_error_ = LastErrorString();
+    CloseHandle(pipe);
+    return false;
+  }
+
   handle_ = FromHandle(pipe);
+  event_handle_ = FromHandle(event);
   connected_ = true;
   last_error_.clear();
   return true;
@@ -361,19 +380,56 @@ bool IpcClient::Connect(const char* name) {
 
 void IpcClient::Disconnect() {
   if (handle_ != kInvalid) {
+    // Send() always resolves its own overlapped write before returning, so
+    // nothing should be in flight here. Belt and braces: this runs before the
+    // event handle is closed, so a stray completion cannot signal into it.
+    CancelIoEx(ToHandle(handle_), nullptr);
     CloseHandle(ToHandle(handle_));
     handle_ = kInvalid;
+  }
+  if (event_handle_ != kInvalid) {
+    CloseHandle(ToHandle(event_handle_));
+    event_handle_ = kInvalid;
   }
   connected_ = false;
 }
 
 bool IpcClient::Send(const TreadmillPacket& packet) {
   if (!connected_) return false;
+
+  HANDLE pipe = ToHandle(handle_);
+  HANDLE event = ToHandle(event_handle_);
+  OVERLAPPED ov = {};
+  ov.hEvent = event;
+  ResetEvent(event);
+
   DWORD written = 0;
-  if (!WriteFile(ToHandle(handle_), &packet, sizeof(packet), &written,
-                 nullptr) ||
-      written != sizeof(packet)) {
-    last_error_ = LastErrorString();
+  if (!WriteFile(pipe, &packet, sizeof(packet), &written, &ov)) {
+    if (GetLastError() != ERROR_IO_PENDING) {
+      last_error_ = LastErrorString();
+      Disconnect();
+      return false;
+    }
+    // Mirrors the POSIX SO_SNDTIMEO: a wedged vrserver must never freeze the
+    // companion's UI thread. At 100 Hz a packet is worth 10 ms, so dropping
+    // the link and reconnecting beats stalling on a stale one.
+    if (WaitForSingleObject(event, kSendTimeoutMs) != WAIT_OBJECT_0) {
+      CancelIoEx(pipe, &ov);
+      GetOverlappedResult(pipe, &ov, &written, TRUE);
+      last_error_ = "send timed out after " +
+                    std::to_string(kSendTimeoutMs) + " ms";
+      Disconnect();
+      return false;
+    }
+    if (!GetOverlappedResult(pipe, &ov, &written, FALSE)) {
+      last_error_ = LastErrorString();
+      Disconnect();
+      return false;
+    }
+  }
+
+  if (written != sizeof(packet)) {
+    last_error_ = "short write";
     Disconnect();
     return false;
   }

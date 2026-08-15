@@ -57,23 +57,65 @@ sudo apt install build-essential cmake libsdl2-dev   # Debian/Ubuntu
 
 ### Windows
 
-Needs Visual Studio 2019+ (Desktop C++ workload) and CMake. SDL2 is fetched
-automatically, so there is nothing to install by hand.
+Needs the MSVC C++ toolchain and CMake. SDL2 and Dear ImGui are fetched
+automatically, so there is nothing else to install by hand. If you have neither
+tool yet, `winget` supplies both — the Build Tools install is a few GB and
+prompts for elevation:
 
 ```
-cmake -S . -B build
+winget install --id Kitware.CMake --scope machine
+winget install --id Microsoft.VisualStudio.2022.BuildTools --override ^
+  "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+Full Visual Studio 2019+ with the Desktop C++ workload works just as well.
+
+```
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-`SDL2.dll` is copied next to `convr_companion.exe` automatically.
+**Build 64-bit.** SteamVR only ever loads `bin/win64`, and the Visual Studio
+2019 generator defaults to Win32 — a 32-bit build stages a DLL that vrserver
+then silently refuses to load. `-A x64` is the fix; the build now fails at
+configure time rather than letting you find out from an empty log.
+
+Outputs land in `build\bin\` for every configuration, not `build\bin\Release\`.
+`SDL2.dll` is copied next to `convr_companion.exe` automatically, and the
+companion links as a GUI app, so no console window trails behind it.
+
+Use MSVC rather than MinGW for the driver. SteamVR loads `driver_convr.dll`
+across an MSVC-ABI boundary, and GCC orders a hidden struct-return pointer
+against `this` the other way round — `GetPose()` returns `DriverPose_t` by
+value, so a MinGW build can load and then misbehave in ways that look like a
+driver bug rather than an ABI mismatch.
 
 ## Installing the driver
+
+On Windows, use the install script. It does the whole job — finds SteamVR from
+the registry and `libraryfolders.vdf` (so a SteamVR on a second drive is found
+without being told), copies the driver, merges the two settings SteamVR needs
+into `steamvr.vrsettings` while preserving everything already in that file, and
+takes a timestamped backup first:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+It refuses to run while SteamVR is open, because vrserver holds the old
+`driver_convr.dll` locked and the install would not take effect until a
+restart anyway. It elevates itself only if the drivers directory actually needs
+it — a Steam installed under `Program Files (x86)` usually grants its own
+folder write access, since Steam self-updates.
+
+The cross-platform equivalent, which copies the driver but does not touch any
+settings:
 
 ```
 cmake --install build --component driver
 ```
 
-This copies `build/convr/` into the SteamVR drivers directory:
+Either way this copies `build/convr/` into the SteamVR drivers directory:
 
 | OS | Path |
 | --- | --- |
@@ -108,6 +150,9 @@ it usually just works. **One setting you almost certainly do need** is
 HMD's driver. Without it SteamVR may load only the driver that provides the
 headset.
 
+On Windows `scripts\install-windows.ps1` already merged both keys for you; this
+section is what it did, and what to do by hand elsewhere.
+
 Edit `steamvr.vrsettings` while SteamVR is **closed**:
 
 | OS | Path |
@@ -131,8 +176,8 @@ Merge those keys into the existing JSON — do not replace the file.
 ## Running the companion
 
 ```
-./build/bin/convr_companion            # Linux
-build\bin\Release\convr_companion.exe  # Windows
+./build/bin/convr_companion       # Linux
+build\bin\convr_companion.exe     # Windows
 ```
 
 Optional: `--config <path>` to use a config file somewhere other than the
@@ -241,6 +286,64 @@ with you.
 
    `grep convr ~/.steam/steam/logs/vrserver.txt` also shows the driver loading,
    the device activating, and the companion connecting or disconnecting.
+
+## Verifying on Windows
+
+The quickest answer comes from the status checker, which walks the whole chain
+— device, install, settings, vrserver, driver load, IPC pipe, companion — and
+marks each link. The first `[FAIL]` is the one to fix; everything after it
+fails as a consequence:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\check-windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts\check-windows.ps1 -Follow
+```
+
+`-Follow` re-checks every two seconds, so you can watch the links come up while
+SteamVR starts. It only reads — it is safe to run at any time.
+
+The rest of this section is what it checks, for when you want to look yourself.
+Steps 1-4 above apply unchanged; only the paths differ.
+
+| | Windows |
+| --- | --- |
+| Driver log | `C:\Program Files (x86)\Steam\logs\vrserver.txt` |
+| Endpoint shown in the companion | `\\.\pipe\convr_treadmill` |
+| Config file | `%APPDATA%\convr\companion.ini` |
+
+`CONVR_DEBUG=1` has to be set for vrserver, and vrserver is started by Steam
+rather than by you, so set it before launching SteamVR:
+
+```
+setx CONVR_DEBUG 1        # persistent; new processes only
+setx CONVR_DEBUG ""       # undo when you no longer want the logging
+```
+
+`setx` only affects processes started afterwards, so **Steam must be fully
+exited and restarted** to pick it up — not just SteamVR. If Steam was already
+running, the driver still works, you just get no `rx packets=` lines.
+
+Then search the log the same way `grep` does on Linux:
+
+```
+Select-String convr "C:\Program Files (x86)\Steam\logs\vrserver.txt"
+```
+
+Two checks that need no HMD and take seconds:
+
+- **The IPC link.** `cmake -S . -B build -DCONVR_BUILD_TESTS=ON` then
+  `build\bin\convr_ipc_selftest.exe` exercises connect, a 500-packet burst,
+  framing, the second-companion refusal, and reconnect over the real named
+  pipe. It passes on Windows.
+- **The driver binary.** If SteamVR shows no `convr` lines at all, confirm the
+  DLL is loadable before looking anywhere else — a DLL that fails to load
+  produces no log output to debug from:
+
+  ```
+  dumpbin /EXPORTS build\convr\bin\win64\driver_convr.dll
+  ```
+
+  It must list `HmdDriverFactory`, and the header must read `machine (x64)`.
 
 ## Developing and testing without an HMD
 
@@ -369,6 +472,39 @@ separate device with the locomotion role, not a replacement for either hand.
 
 Save the binding; SteamVR remembers it per-application.
 
+### The binding image is not decoration
+
+`convr_treadmill_profile.json` must declare **both** `input_bindingui_left` and
+`input_bindingui_right`, each pointing at an image under `resources/icons/`.
+They look like cosmetic fields and they are not.
+
+SteamVR's binding editor is a CEF page. Its render path reads
+`input_bindingui_right.transform` with no null check, and the pose/haptics tabs
+read `input_bindingui_left.transform` the same way:
+
+```js
+// controllerbindingui.js, verbatim
+let n = e.input_bindingui_right.transform ? e.input_bindingui_right.transform : ""
+```
+
+With either key missing, that throws `TypeError: Cannot read properties of
+undefined (reading 'transform')`, React unwinds the whole tree, and **Manage
+Bindings opens as an empty black window** — no error text, nothing in
+`vrserver.txt`. The exception shows up only in
+`Steam/logs/vrwebhelper_controllerbinding_desktop.txt`. Every controller type
+SteamVR ships declares at least `input_bindingui_right`, including the
+single-device ones (gamepad, all the Vive trackers), which is why nothing else
+trips over it.
+
+`"priority": 5` matters for the same reason. The editor auto-selects a
+controller by score, `1000 * (999 - priority) + 10 * deviceCount + …`, so a
+device left at the default priority 0 outranks the hand controllers whenever
+those are asleep and the editor opens on the treadmill by default. Trackers use
+5–6; the treadmill is the same kind of secondary device.
+
+`resources/localization/localization.json` is what makes the device list say
+*conVR Treadmill* instead of the raw string `convr_treadmill`.
+
 ### An honest caveat about legacy-input games
 
 Skyrim VR uses OpenVR's **legacy input** API rather than the modern
@@ -395,6 +531,56 @@ will map a treadmill-role device onto a legacy title's movement input.
 
 That last step needs a real HMD and had not been tried at the time of writing.
 
+### What a real HMD showed
+
+Two things were confirmed on hardware (Quest 2, Skyrim VR, app 611670):
+
+- The shipped `legacy_bindings_convr_treadmill.json` was **inert**. It named
+  `/actions/legacy/in/Axis0`, which does not exist — SteamVR's
+  `resources/config/legacy_actions.json` only defines `Left_Axis0_Value`,
+  `Right_Axis0_Value` and a `legacy_mirrored` variant. Fixed; the default now
+  targets `left_axis0_value`.
+- The treadmill and the physical left thumbstick **compete for one action**.
+  Skyrim's Touch binding maps `/user/hand/left/input/joystick` to
+  `left_axis0_value`, and a treadmill binding has to target that same action to
+  reach the game. The resting stick reports zero continuously.
+
+Whether a `/user/treadmill` source survives that contest is still unmeasured.
+Legacy state is frozen while the hand controllers are in `Standby`, so any
+measurement taken with the headset off reads zero for **every** device and
+proves nothing — check `GetTrackedDeviceActivityLevel` before believing a flat
+axis.
+
+## Fallback: keyboard emulation
+
+If a game cannot see the treadmill through SteamVR at all, the companion can
+send real keystrokes instead. **Companion → Keyboard fallback (legacy games).**
+Off by default, and it should stay off whenever the SteamVR binding works: this
+path is on/off where the real one is analog.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Enable keyboard fallback | off | Master switch |
+| Key-down threshold | 0.15 | Belt output above this holds the key |
+| Forward / Backward key | W / S | Held while the belt runs |
+| Sprint key | Left Shift | Held while sprint is active and moving forward |
+| Only send while the game is focused | **on** | Safety gate, see below |
+| Game process | `SkyrimVR` | Executable name, `.exe` optional |
+
+Keystrokes are global: they go to whichever window has focus. The focus gate
+exists so that walking on the belt cannot type into your browser, and it is on
+by default for that reason — turn it off only if you know why you are doing
+that. Keys are released when the game loses focus, when the belt stops, when
+the toggle goes off, and by the destructor on exit, so quitting mid-stride
+cannot leave `W` stuck down.
+
+Windows only. On Linux the toggle reports that and does nothing.
+
+Why keystrokes rather than a virtual gamepad: a virtual pad (ViGEm) is the
+nicer answer because it is analog, but it needs a kernel driver installed with
+administrator rights. Synthetic keys need nothing and every PC title reads
+them.
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -410,16 +596,37 @@ That last step needs a real HMD and had not been tried at the time of writing.
 | Stick never reaches full travel | Lower *Full deflection at*. |
 | Companion and driver both look healthy, game does nothing | Legacy-input limitation — see the caveat above before debugging anything else. |
 | Driver changes have no effect | Re-run `cmake --install` and restart SteamVR; the old `.so`/`.dll` stays loaded otherwise. |
+| **Manage Bindings opens as a black empty window** | The input profile is missing `input_bindingui_left`/`input_bindingui_right`, or the image they name is not installed. See *The binding image is not decoration* above; confirm with `vrwebhelper_controllerbinding_desktop.txt`. |
+| Treadmill missing from the controller list, then present after a restart | Its input profile only becomes known to SteamVR when `Activate()` runs, which can lag `TrackedDeviceAdded` by minutes while the HMD is asleep. The binding UI lists what it knew at query time. Reopen the window rather than restarting. |
+| Treadmill is listed as `convr_treadmill` rather than by name | `resources/localization/localization.json` was not installed. |
+| Bound correctly in SteamVR, character still does not move | Legacy-input title. The treadmill and the real left thumbstick both drive `left_axis0_value` and the resting stick reports zero. Try unbinding the left stick there; failing that, use the keyboard fallback. |
+| Keyboard fallback does nothing | Focus gate: the game must be the focused window, and *Game process* must match its executable name. The status line under the toggle says which it is waiting for. |
+| A key stayed down after the companion exited | Should be impossible — report it. Keys are released on stop, on focus loss, on toggle-off and in the destructor. |
+| **Windows:** driver never loads, nothing in the log | 32-bit build. SteamVR only loads `bin/win64`. Reconfigure with `-A x64`. |
+| **Windows:** install script refuses to run | SteamVR is still open. vrserver keeps `driver_convr.dll` locked, so installing over it would not take effect. |
+| **Windows:** input freezes whenever the companion is not the focused window | An old build. `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS` has to be set *before* `SDL_Init`, or SDL stops delivering joystick input on focus loss — which is every moment you are actually in the headset. |
+| **Windows:** UI is tiny or blurry on a scaled display | An old build, from before the companion declared per-monitor DPI awareness and scaled the layout. |
 
 ## Layout
 
 ```
 common/     IPC shim + wire format, shared by both programs
 driver/     SteamVR driver (.so / .dll) + manifest and input profile
-companion/  SDL2 + Dear ImGui tuning and streaming app
+companion/  SDL2 + Dear ImGui tuning and streaming app (+ keyboard fallback)
+scripts/    Windows install helper
 ```
 
-The only OS-specific code in the project is inside `common/convr_ipc.cpp`.
+Nearly all OS-specific code is inside `common/convr_ipc.cpp` — the transport is
+the one thing the two platforms genuinely do differently. The remaining
+`#if defined(_WIN32)` blocks are small and isolated: the config-file location
+in `companion/src/config.cpp`, the DLL export macro in
+`driver/src/driver_factory.cpp`, and one assertion in `common/ipc_selftest.cpp`
+covering who refuses a second companion.
+
+The companion's Windows-facing behaviour needs no `#ifdef` at all: the
+DPI-awareness hint and the background-joystick hint are SDL hints that are
+simply inert on Linux, and the UI scale factor comes from `SDL_GetDisplayDPI`,
+which returns 1.0 on a 96 dpi display either way.
 
 ### The IPC link
 
@@ -440,10 +647,23 @@ disagreeing about where to meet. Set `CONVR_IPC_PATH` on **both** processes to
 override it.
 
 The server runs a background thread doing blocking accept/read and publishes
-only the newest packet, so the driver's `RunFrame` never blocks on I/O. It
-serves one companion at a time and accepts-then-immediately-closes any extra,
-so a second copy gets a clean disconnect it can report and retry from rather
-than sends that mysteriously fail.
+only the newest packet, so the driver's `RunFrame` never blocks on I/O.
+
+It serves one companion at a time, and both platforms end up refusing a second
+one cleanly — but by different routes, which is worth knowing when reading the
+self-test. Windows gets it for free: the pipe is created with a single
+instance, so the kernel fails the second `CreateFile` with `ERROR_PIPE_BUSY`
+and the server never sees it. On Linux a second companion would otherwise sit
+unaccepted in the backlog and watch its sends fail with `EAGAIN`, which looks
+like a broken driver, so the server accepts and immediately closes it and
+counts the rejection. Either way the newcomer gets a clean disconnect it can
+report and retry from, and the incumbent is untouched.
+
+Neither side may ever block the companion's UI thread on a wedged vrserver, so
+a send that cannot complete within 100 ms drops the link and lets the normal
+once-a-second reconnect pick it back up. Linux gets that from `SO_SNDTIMEO`;
+Windows has no equivalent for a pipe, so the client writes overlapped and waits
+on the event with a timeout.
 
 ### Driver interface versions
 
