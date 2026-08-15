@@ -551,6 +551,36 @@ measurement taken with the headset off reads zero for **every** device and
 proves nothing — check `GetTrackedDeviceActivityLevel` before believing a flat
 axis.
 
+## Legacy-input games cannot see the treadmill, and this is not fixable
+
+Skyrim VR and other legacy-input titles build their controller state from the
+two hand devices only. A treadmill-role device can be correctly bound, with the
+binding confirmed loaded by vrserver, and still never arrive.
+
+Measured against a live session, with `/user/treadmill/input/joystick` bound to
+`/actions/legacy/in/left_axis0_value`:
+
+```
+t=14.4-16.4s   left ax0 sweeps a full unit circle   <- a physical thumbstick;
+                                                       the read path is sound
+t=24-40s       belt |y| up to 0.524                 <- driver log
+               left ax0 = (+0.000, +0.000)          <- flat throughout
+               treadmill pkt = 0                    <- never populated at all
+```
+
+The positive control matters: without a known-good input in the same trace, a
+flat axis only proves that nothing happened. Here something demonstrably did.
+
+**SteamVR does not route `/user/treadmill` sources into hand legacy state.**
+Valve's own gamepad driver ships no legacy binding either, for the same reason.
+Nothing in this repo can change that, which is what the next section is for.
+
+Two traps when measuring this yourself. Controllers in `Standby` have frozen
+legacy state, so a reading taken while the headset is off measures nothing —
+check `GetTrackedDeviceActivityLevel` first. And a peak-magnitude heuristic
+cannot tell the belt from a hand: the belt always reports `x=+0.000`, so any
+sample with a non-zero `x` came from a thumbstick, not the treadmill.
+
 ## Fallback: keyboard emulation
 
 If a game cannot see the treadmill through SteamVR at all, the companion can
@@ -562,10 +592,36 @@ path is on/off where the real one is analog.
 | --- | --- | --- |
 | Enable keyboard fallback | off | Master switch |
 | Key-down threshold | 0.15 | Belt output above this holds the key |
+| Hold after stop | 400 ms | Bridges the dip between footfalls, see below |
 | Forward / Backward key | W / S | Held while the belt runs |
 | Sprint key | Left Shift | Held while sprint is active and moving forward |
 | Only send while the game is focused | **on** | Safety gate, see below |
 | Game process | `SkyrimVR` | Executable name, `.exe` optional |
+
+### Why the key has to be held after the belt stops
+
+A belt driven by a walking human is not a steady signal. Each footfall drives
+it and it coasts back between steps, so the speed crosses the threshold several
+times a second even while you walk steadily. A live capture of one such walk:
+
+```
+21:59:57  y=+0.397
+22:00:00  y=-0.092
+22:00:04  y=+0.433
+22:00:06  y=-0.229
+22:00:14  y=-0.524
+```
+
+The firmware already low-pass filters this (`VELOCITY_FILTER_ALPHA`, 0.10 at
+100 Hz) and it still swings, because the step cadence is slower than the
+filter. That is fine for an analog stick and fatal for a key: pressing and
+releasing on every crossing stutters instead of walking.
+
+So the key presses immediately but its release is delayed by *Hold after stop*,
+and releases at half the press threshold so it cannot chatter at the boundary.
+Too low and you stutter; too high and you keep walking after you have stopped.
+
+### Safety
 
 Keystrokes are global: they go to whichever window has focus. The focus gate
 exists so that walking on the belt cannot type into your browser, and it is on
@@ -592,6 +648,9 @@ them.
 | An axis sits at `-32768` and never moves | That axis is not reported by the firmware. It is not your belt axis. |
 | Sprint button does nothing | Firmware numbers buttons from 1, SDL from 0. The pushbutton is **SDL 0**; firmware auto-sprint is **SDL 8**. |
 | You walk forward and the game walks backward | Toggle *Invert forward*. |
+| SteamVR shows treadmill input but a legacy game ignores it | Expected. Legacy titles cannot read a treadmill-role device; use the keyboard fallback. |
+| Fallback works but the character stutters | Raise *Hold after stop*. The belt dips below threshold between footfalls. |
+| Fallback settings revert on restart | They are only written when you press **Save** under *Config file*. |
 | Second companion shows "not connected" | By design — the driver serves one companion at a time and turns away extras cleanly. Close the first one. |
 | Stick never reaches full travel | Lower *Full deflection at*. |
 | Companion and driver both look healthy, game does nothing | Legacy-input limitation — see the caveat above before debugging anything else. |
